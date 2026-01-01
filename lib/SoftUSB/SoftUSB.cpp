@@ -8,6 +8,9 @@
 #include "SoftUSB.h"
 #include "soc/gpio_struct.h"
 #include "driver/gpio.h"
+#include "soc/usb_serial_jtag_struct.h"
+#include "soc/usb_serial_jtag_reg.h"
+#include "esp_cpu.h"
 
 // Disable interrupts for critical timing sections
 #define ENTER_CRITICAL() portDISABLE_INTERRUPTS()
@@ -112,20 +115,32 @@ SoftUSBKeyboard::SoftUSBKeyboard(uint8_t pinDp, uint8_t pinDm)
 }
 
 bool SoftUSBKeyboard::begin() {
-    // Configure GPIO with internal pull-ups
-    // Note: ESP32 internal pull-up is ~45kΩ, USB spec requires 1.5kΩ for D-
-    // This may work but is out of spec - external resistor recommended
-    gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_INPUT_OUTPUT_OD; // Open drain for bidirectional
-    io_conf.pin_bit_mask = (1ULL << _pinDp) | (1ULL << _pinDm);
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE; // Enable internal pull-up
-    gpio_config(&io_conf);
+    // Disable ESP32-C3's built-in USB Serial/JTAG to free GPIO18/19
+    USB_SERIAL_JTAG.conf0.usb_pad_enable = 0;
+    USB_SERIAL_JTAG.conf0.dp_pullup = 0;  // Disable D+ pullup from internal USB
     
-    // For Low-Speed USB, D- needs pull-up to signal device attachment
-    // Enable stronger pull-up on D- using GPIO pad configuration
+    // First, configure D+ (must have NO pull-up for Low-Speed)
+    gpio_config_t dp_conf = {};
+    dp_conf.intr_type = GPIO_INTR_DISABLE;
+    dp_conf.mode = GPIO_MODE_INPUT_OUTPUT_OD;
+    dp_conf.pin_bit_mask = (1ULL << _pinDp);
+    dp_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    dp_conf.pull_up_en = GPIO_PULLUP_DISABLE; // NO pull-up on D+!
+    gpio_config(&dp_conf);
+    gpio_set_pull_mode((gpio_num_t)_pinDp, GPIO_FLOATING);
+    
+    // Configure D- with pull-up (signals Low-Speed device)
+    gpio_config_t dm_conf = {};
+    dm_conf.intr_type = GPIO_INTR_DISABLE;
+    dm_conf.mode = GPIO_MODE_INPUT_OUTPUT_OD;
+    dm_conf.pin_bit_mask = (1ULL << _pinDm);
+    dm_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    dm_conf.pull_up_en = GPIO_PULLUP_ENABLE; // Pull-up on D- for Low-Speed
+    gpio_config(&dm_conf);
     gpio_set_pull_mode((gpio_num_t)_pinDm, GPIO_PULLUP_ONLY);
+    
+    Serial.printf("SoftUSB: D+ on GPIO%d (no pullup), D- on GPIO%d (pullup)\n", _pinDp, _pinDm);
+    Serial.println("SoftUSB: Internal USB disabled, using GPIO mode");
     
     // Start in idle state (J state for LS: D+ low, D- high)
     // With internal pull-up on D-, the line will be pulled high
@@ -142,7 +157,9 @@ bool SoftUSBKeyboard::begin() {
     setInput();
     EXIT_CRITICAL();
     
-    Serial.println("SoftUSB: Device attached");
+    Serial.println("SoftUSB: Device attached, ready for enumeration");
+    Serial.printf("Initial state: D+=%d D-=%d\n", getDP(), getDM());
+    
     return true;
 }
 
@@ -182,18 +199,33 @@ inline void SoftUSBKeyboard::setInput() {
 }
 
 // Delay for one bit period (666.67ns at 1.5Mbps)
-// At 160MHz, ~107 cycles
+// At 160MHz, ~107 cycles per bit
+// Using inline NOP for minimal overhead
 void SoftUSBKeyboard::delayBit() {
-    // Use NOP loops for precise timing
-    for (volatile int i = 0; i < 25; i++) {
-        __asm__ __volatile__("nop");
-    }
+    // 107 cycles = ~17 iterations of 6-cycle loop + overhead
+    // Tuned experimentally
+    __asm__ volatile(
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 10
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 20
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 30
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 40
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 50
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 60
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 70
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 80
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 90
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\n"                 // 97 (+ ~10 overhead)
+    );
 }
 
 void SoftUSBKeyboard::delayHalfBit() {
-    for (volatile int i = 0; i < 12; i++) {
-        __asm__ __volatile__("nop");
-    }
+    __asm__ volatile(
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 10
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 20
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 30
+        "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"  // 40
+        "nop\nnop\nnop"                                       // 43 (+ ~10 overhead)
+    );
 }
 
 // Send SE0 (Single-Ended Zero: both D+ and D- low)
@@ -338,82 +370,201 @@ void SoftUSBKeyboard::sendDataPacket(uint8_t pid, const uint8_t* data, uint8_t l
     sendPacket(packet, len + 3);
 }
 
-// Wait for and receive a packet from host
+// Edge buffer - records timestamp and state at each transition
+// Format: lower 8 bits = cycle count / 8, upper 8 bits = D+/D- state
+#define EDGE_BUF_SIZE 128
+static uint16_t edgeBuf[EDGE_BUF_SIZE];
+static volatile uint8_t edgeCount;
+
+// Get cycle count divided by 8 (for fitting in 8 bits with enough resolution)
+static inline uint8_t getCycleCount8() {
+    return (uint8_t)(esp_cpu_get_cycle_count() >> 3);
+}
+
+// Wait for and receive a packet using edge-triggered recording
+// This method is inspired by sdima1357's esp32_usb_soft_host
 bool SoftUSBKeyboard::waitForPacket(uint8_t* buffer, uint8_t* len, uint32_t timeoutUs) {
-    uint32_t start = micros();
+    uint32_t dpMask = (1 << _pinDp);
+    uint32_t dmMask = (1 << _pinDm);
+    uint32_t bothMask = dpMask | dmMask;
+    volatile uint32_t* inReg = &GPIO.in.val;
     
-    // Wait for K state (start of SYNC)
-    while (!getDP() || getDM()) {
+    // Wait for K state (D+ high) - this is non-critical so don't block too long
+    uint32_t start = micros();
+    while (!(*inReg & dpMask)) {
         if (micros() - start > timeoutUs) return false;
     }
     
-    // Skip SYNC pattern
-    delayBit();
-    for (int i = 0; i < 7; i++) {
-        delayBit();
-    }
+    // Now capture edges with timestamps
+    ENTER_CRITICAL();
     
-    // Receive bytes until EOP (SE0)
-    *len = 0;
-    bool lastBit = true;
-    uint8_t onesCount = 0;
+    uint32_t val = (*inReg & bothMask);
+    uint32_t nval;
+    uint8_t recIdx = 0;
+    int timeout = 800; // ~5us at 160MHz with this loop
     
-    while (*len < 64) {
-        uint8_t byte = 0;
-        for (int i = 0; i < 8; i++) {
-            delayHalfBit();
-            
-            // Check for EOP (SE0)
-            if (!getDP() && !getDM()) {
-                return *len > 0;
-            }
-            
-            // Read bit (NRZI decode)
-            bool currentState = getDP();
-            uint8_t bit = (currentState == lastBit) ? 1 : 0;
-            lastBit = currentState;
-            
-            // Skip stuffed bits
-            if (bit == 1) {
-                onesCount++;
-                if (onesCount == 6) {
-                    delayBit(); // Skip stuff bit
-                    onesCount = 0;
-                    i--; // Don't count this bit
-                    continue;
-                }
-            } else {
-                onesCount = 0;
-            }
-            
-            byte |= (bit << i);
-            delayHalfBit();
+    edgeBuf[recIdx++] = getCycleCount8() | ((val >> (_pinDp > _pinDm ? _pinDm : _pinDp)) << 8);
+    
+    while (recIdx < EDGE_BUF_SIZE && timeout > 0) {
+        nval = (*inReg & bothMask);
+        if (nval != val) {
+            edgeBuf[recIdx++] = getCycleCount8() | ((nval >> (_pinDp > _pinDm ? _pinDm : _pinDp)) << 8);
+            val = nval;
+            timeout = 800;
+        } else {
+            timeout--;
         }
-        buffer[(*len)++] = byte;
     }
     
-    return true;
+    EXIT_CRITICAL();
+    edgeCount = recIdx;
+    
+    if (recIdx < 10) return false; // Not enough edges for a packet
+    
+    // Decode the packet from edge transitions
+    // Calculate bit time from SYNC pattern (KJKJKJKK = alternating)
+    // First few transitions should be ~1 bit apart
+    
+    int bitTime = 0;
+    int transCount = 0;
+    for (int i = 1; i < recIdx && i < 8; i++) {
+        int delta = (edgeBuf[i] & 0xFF) - (edgeBuf[i-1] & 0xFF);
+        if (delta < 0) delta += 256; // Handle wraparound
+        if (delta > 5 && delta < 30) { // Reasonable bit time range (8-15 cycles/8 = 1-2 bit times)
+            bitTime += delta;
+            transCount++;
+        }
+    }
+    if (transCount > 0) {
+        bitTime = bitTime / transCount;
+    } else {
+        bitTime = 13; // ~107 cycles / 8 = ~13
+    }
+    
+    // Decode NRZI from edges
+    // Each edge represents a '0' bit, no edge for 1 bit time = '1' bit
+    *len = 0;
+    uint8_t currentByte = 0;
+    int bitPos = 0;
+    int onesCount = 0;
+    bool inSync = true;
+    int syncBits = 0;
+    
+    for (int i = 1; i < recIdx; i++) {
+        int delta = (edgeBuf[i] & 0xFF) - (edgeBuf[i-1] & 0xFF);
+        if (delta < 0) delta += 256;
+        
+        // How many bit periods in this delta?
+        int bits = (delta + bitTime/2) / bitTime;
+        if (bits < 1) bits = 1;
+        if (bits > 8) bits = 8;
+        
+        // bits-1 ones followed by one zero (edge = 0 in NRZI)
+        for (int b = 0; b < bits - 1; b++) {
+            if (inSync) {
+                syncBits++;
+                if (syncBits >= 7) { // End of SYNC (last bit is 0 at transition)
+                    inSync = false;
+                }
+                continue;
+            }
+            
+            // Handle bit stuffing
+            onesCount++;
+            if (onesCount == 6) {
+                onesCount = 0;
+                continue; // Skip stuff bit
+            }
+            
+            currentByte |= (1 << bitPos);
+            bitPos++;
+            if (bitPos == 8) {
+                buffer[(*len)++] = currentByte;
+                currentByte = 0;
+                bitPos = 0;
+                if (*len >= 16) break;
+            }
+        }
+        
+        if (*len >= 16) break;
+        
+        // The transition itself represents a 0 bit
+        if (inSync) {
+            syncBits++;
+            continue;
+        }
+        
+        onesCount = 0;
+        // 0 bit - don't set the bit (already 0)
+        bitPos++;
+        if (bitPos == 8) {
+            buffer[(*len)++] = currentByte;
+            currentByte = 0;
+            bitPos = 0;
+            if (*len >= 16) break;
+        }
+        
+        // Check for SE0 (end of packet)
+        uint8_t state = edgeBuf[i] >> 8;
+        if (state == 0) break; // SE0
+    }
+    
+    // Handle any remaining bits
+    if (bitPos > 0 && *len < 16) {
+        buffer[(*len)++] = currentByte;
+    }
+    
+    return *len > 0;
 }
 
 // Main task - must be called frequently
 void SoftUSBKeyboard::task() {
+    static uint32_t lastDebug = 0;
+    static uint32_t packetCount = 0;
+    static uint32_t edgeCount = 0;
+    static bool lastDp = false;
+    
+    // Simple edge detection to verify we see activity
+    bool dp = getDP();
+    if (dp != lastDp) {
+        edgeCount++;
+        lastDp = dp;
+    }
+    
+    // Debug: show line states every second
+    if (millis() - lastDebug > 1000) {
+        lastDebug = millis();
+        Serial.printf("USB: D+=%d D-=%d, edges=%lu, pkts=%lu\n", 
+                      getDP(), getDM(), edgeCount, packetCount);
+        edgeCount = 0; // Reset edge counter
+    }
+    
     uint8_t buffer[64];
     uint8_t len;
     
-    // Check for incoming packet
-    if (waitForPacket(buffer, &len, 100)) {
+    // Check for incoming packet (5ms timeout to catch host retries)
+    if (waitForPacket(buffer, &len, 5000)) {
+        packetCount++;
         if (len < 1) return;
         
         uint8_t pid = buffer[0];
+        // Print all received bytes for debug
+        Serial.printf("RX len=%d: ", len);
+        for (int i = 0; i < len && i < 16; i++) {
+            Serial.printf("%02X ", buffer[i]);
+        }
+        Serial.println();
         
         switch (pid) {
             case USB_PID_SETUP:
-                if (len >= 3) {
-                    // Next packet should be DATA0 with setup data
-                    if (waitForPacket(buffer, &len, 1000) && buffer[0] == USB_PID_DATA0) {
-                        sendHandshake(USB_PID_ACK);
-                        handleSetupPacket(&buffer[1]);
-                    }
+                Serial.println("-> SETUP token");
+                // Next packet should be DATA0 with setup data
+                if (waitForPacket(buffer, &len, 5000) && buffer[0] == USB_PID_DATA0) {
+                    Serial.printf("-> DATA0 len=%d\n", len);
+                    sendHandshake(USB_PID_ACK);
+                    handleSetupPacket(&buffer[1]);
+                } else {
+                    Serial.println("-> No DATA0 received");
                 }
                 break;
                 
@@ -433,8 +584,11 @@ void SoftUSBKeyboard::task() {
                 // Host sending data to us
                 if (waitForPacket(buffer, &len, 1000)) {
                     sendHandshake(USB_PID_ACK);
-                    // Could handle LED status here
                 }
+                break;
+                
+            default:
+                Serial.printf("-> Unknown PID: 0x%02X\n", pid);
                 break;
         }
     }

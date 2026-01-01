@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MPR121.h>
-#include "SoftUSB.h"
+#include "SoftUSB_GPIO.h"
 
 #define SDA_PIN 2
 #define SCL_PIN 1
@@ -15,7 +15,7 @@
 Adafruit_MPR121 mpr1 = Adafruit_MPR121();
 Adafruit_MPR121 mpr2 = Adafruit_MPR121();
 
-SoftUSBKeyboard Keyboard(USB_DP_PIN, USB_DM_PIN);
+SoftUSBKeyboard_GPIO Keyboard(USB_DP_PIN, USB_DM_PIN);
 
 // baseline thresholds per electrode
 const uint8_t btnbaseline[24] = {11, 11, 12, 11, 10, 11, 12, 9,
@@ -92,6 +92,14 @@ void setup() {
 }
 
 void loop() {
+  // Run SoftUSB task first - needs to be called frequently for USB timing
+  Keyboard.task();
+  
+  // Handle touch input less frequently
+  static uint32_t lastTouch = 0;
+  if (millis() - lastTouch < 20) return;
+  lastTouch = millis();
+  
   // Build current touched bitmask (24 bits: mpr1[0..11] + mpr2[0..11])
   uint32_t curTouched = 0;
 
@@ -126,9 +134,6 @@ void loop() {
 
   prevTouched = curTouched;
 
-  // Run SoftUSB task to handle USB protocol
-  Keyboard.task();
-
   // Debug print every 500ms
   static uint32_t lastDebug = 0;
   if (millis() - lastDebug > 500) {
@@ -140,6 +145,4 @@ void loop() {
     }
     Serial.println();
   }
-
-  delay(10);
 }
