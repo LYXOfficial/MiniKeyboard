@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MPR121.h>
-#include "SoftUSB_GPIO.h"
+#include "BLEKeyboard.h"
 
 #define SDA_PIN 2
 #define SCL_PIN 1
@@ -15,7 +15,7 @@
 Adafruit_MPR121 mpr1 = Adafruit_MPR121();
 Adafruit_MPR121 mpr2 = Adafruit_MPR121();
 
-SoftUSBKeyboard_GPIO Keyboard(USB_DP_PIN, USB_DM_PIN);
+// Using BLE keyboard instead of SoftUSB
 
 // baseline thresholds per electrode
 const uint8_t btnbaseline[24] = {11, 11, 12, 11, 10, 11, 12, 9,
@@ -42,6 +42,12 @@ const uint8_t btnbaseline[24] = {11, 11, 12, 11, 10, 11, 12, 9,
 #define KEY_KP_0            0x62
 #define KEY_KP_DECIMAL      0x63
 
+// Macro keys (sensors 20-23) mapped to special functions
+#define KEY_F13             0x68
+#define KEY_F14             0x69
+#define KEY_F15             0x6A
+#define KEY_F16             0x6B
+
 const uint8_t hidmap[24] = {
     KEY_NUM_LOCK,      // 0  NumLock
     KEY_KP_DIVIDE,     // 1  /
@@ -60,20 +66,28 @@ const uint8_t hidmap[24] = {
     KEY_KP_ENTER,      // 14 Enter
     KEY_KP_0,          // 15 0
     KEY_KP_DECIMAL,    // 16 .
-    0, 0, 0, 0, 0, 0, 0 // remaining unmapped
+    0, 0, 0,           // 17-19 unmapped
+    KEY_F13,           // 20 Macro key 1
+    KEY_F14,           // 21 Macro key 2
+    KEY_F15,           // 22 Macro key 3
+    KEY_F16            // 23 Macro key 4
 };
 
 // Track previous key states for press/release
 uint32_t prevTouched = 0;
 
+// Long-press detection for macro keys (sensors 20-23)
+uint32_t macroKeyPressTime[4] = {0, 0, 0, 0};
+const uint32_t LONG_PRESS_MS = 1000;
+
 void setup() {
   Serial.begin(115200);
 
-  // Initialize SoftUSB Keyboard
-  Keyboard.begin();
+  // Initialize BLE Keyboard
+  BLEKeyboard.begin();
 
   delay(500);
-  Serial.println("MPR121 HID keyboard start (SoftUSB)");
+  Serial.println("MPR121 HID keyboard start (BLE)");
 
   // I2C
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -92,8 +106,16 @@ void setup() {
 }
 
 void loop() {
-  // Run SoftUSB task first - needs to be called frequently for USB timing
-  Keyboard.task();
+  // Update LED animations
+  BLEKeyboard.updateLEDs();
+  
+  // Monitor connection status
+  static bool lastConnected = false;
+  bool connected = BLEKeyboard.isConnected();
+  if (connected != lastConnected) {
+    lastConnected = connected;
+    Serial.printf("BLE connection changed: %s\n", connected ? "CONNECTED" : "DISCONNECTED");
+  }
   
   // Handle touch input less frequently
   static uint32_t lastTouch = 0;
@@ -114,6 +136,33 @@ void loop() {
     }
   }
 
+  // Check long-press on macro keys (sensors 20-23) for reconnect
+  for (uint8_t i = 20; i < 24; i++) {
+    uint8_t macroIdx = i - 20;
+    
+    if (curTouched & (1UL << i)) {
+      // Key is pressed
+      if (macroKeyPressTime[macroIdx] == 0) {
+        // Just pressed, record time
+        macroKeyPressTime[macroIdx] = millis();
+      } else {
+        // Check if long-press threshold reached
+        if (millis() - macroKeyPressTime[macroIdx] >= LONG_PRESS_MS) {
+          Serial.printf("Long press detected on macro key %d, reconnecting...\n", macroIdx);
+          BLEKeyboard.disconnect();
+          // Reset all press times to avoid repeated triggers
+          for (int j = 0; j < 4; j++) {
+            macroKeyPressTime[j] = 0;
+          }
+          break; // Exit loop after triggering reconnect
+        }
+      }
+    } else {
+      // Key released, reset timer
+      macroKeyPressTime[macroIdx] = 0;
+    }
+  }
+
   // Detect press/release
   uint32_t justPressed = curTouched & ~prevTouched;
   uint32_t justReleased = ~curTouched & prevTouched;
@@ -123,25 +172,42 @@ void loop() {
     if (hid == 0) continue;
 
     if (justPressed & (1UL << i)) {
-      Keyboard.pressKey(hid);
-      Serial.printf("Key %d pressed (HID 0x%02X)\n", i, hid);
+      if (BLEKeyboard.isConnected()) {
+        BLEKeyboard.press(hid);
+        Serial.printf("[CONNECTED] Key %d pressed (HID 0x%02X)\n", i, hid);
+      } else {
+        Serial.printf("[NOT CONNECTED] Key %d pressed ignored\n", i);
+      }
     }
     if (justReleased & (1UL << i)) {
-      Keyboard.releaseKey(hid);
-      Serial.printf("Key %d released (HID 0x%02X)\n", i, hid);
+      if (BLEKeyboard.isConnected()) {
+        BLEKeyboard.release(hid);
+        Serial.printf("[CONNECTED] Key %d released (HID 0x%02X)\n", i, hid);
+      } else {
+        Serial.printf("[NOT CONNECTED] Key %d released ignored\n", i);
+      }
     }
   }
 
   prevTouched = curTouched;
 
-  // Debug print every 500ms
+  // Debug print every 2 seconds
   static uint32_t lastDebug = 0;
-  if (millis() - lastDebug > 500) {
+  if (millis() - lastDebug > 2000) {
     lastDebug = millis();
-    Serial.print("touched: ");
+    Serial.printf("\n=== Status: %s ===\n", BLEKeyboard.isConnected() ? "CONNECTED" : "DISCONNECTED");
+    Serial.print("Touched: ");
     for (uint8_t i = 0; i < 24; i++) {
       Serial.print((curTouched & (1UL << i)) ? '1' : '0');
       if (i == 11) Serial.print('|');
+    }
+    Serial.println();
+    
+    // Print sensor values for first few electrodes
+    Serial.print("Sensor values (first 6): ");
+    for (uint8_t i = 0; i < 6; i++) {
+      uint16_t val = mpr1.filteredData(i);
+      Serial.printf("%d(%d) ", val, btnbaseline[i]);
     }
     Serial.println();
   }
